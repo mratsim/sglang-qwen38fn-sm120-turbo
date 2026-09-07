@@ -1,5 +1,50 @@
 # QSA prefill allocation comparison
 
+## Qualification update: production-geometry exact equality failed
+
+The later September 6 test uses 4096 query rows, 24 query heads, 2 KV heads,
+head dimension 256, and 2048 sparse-index slots (four masked), matching the
+configured head geometry and indexer budget. It covers 131072- and 262144-token
+cached histories. These remain synthetic cache/query tensors and index choices,
+not the model's learned indexer outputs. Run the reproduction command below
+with `--production-geometry` to select these cases.
+
+The [production result](results/qsa-prefill-production-20260906.json) is a
+**failed qualification**, with process exit status 1. Both FP8 cases fail exact
+baseline/candidate equality in both execution orders. Do not treat the earlier
+small-fixture exact-equality result as proof for production geometry.
+This retained September 6 JSON predates the `complete` field and records the
+previous runner hash. Its four selected production cases and `qualified: false`
+remain historical numerical evidence; it does not validate the current
+incremental-report state contract.
+
+| History | Differing values / 25165824 | Maximum absolute difference | FP8 peak saving |
+|---|---:|---:|---:|
+| 131072 | 2690 | 0.00006103515625 | 268435456 bytes (256 MiB) |
+| 262144 | 2867 | 0.00006103515625 | 536870912 bytes (512 MiB) |
+
+Both methods passed the unchanged independent FP32 reference tolerance; maximum
+reference errors were 0.0001220703125 at 128k and 0.000244140625 at 262k for FP8.
+BF16 cases remained exactly equal and had unchanged allocation peaks. This is
+evidence of small numerical differences specific to the changed FP8 path, not
+proof of semantic harm or full-model correctness. The precise kernel/compiler
+mechanism remains unresolved. The exact-equality gate is **not relaxed**.
+
+The runner now records failed numerical assertions and continues through the
+remaining cases so diagnostics are retained, then exits nonzero if any numerical
+assertion failed. Partial reports retain `complete: false` and `qualified: false`
+until every selected case finishes. Memory-saving assertions still fail
+immediately. Previous output files are refused. The grouped FP32 reference avoids
+duplicating KV heads but evaluates every query row. All six original small cases
+were rerun and passed after this generalization. No assertion tolerance, expected
+value, or case was weakened or removed.
+
+A separate candidate server replay retrieved all four expected six-digit values
+over a growing 261722–274143-token chat-formatted context, with prefix reuse and
+no workload errors or retractions. That bounded retrieval pass does not supersede
+this failed numerical gate. Detailed server artifacts and rollback state are in
+the workstation bundle's `OPERATIONS-NOTES.md`. Keep the PR draft pending resolution.
+
 Patch 0008 removes the full-history cache-to-query-dtype casts introduced by
 patch 0001. The existing sparse kernel already converts loaded tiles before
 arithmetic. Gathered and concatenated FP8 histories can therefore remain FP8.
@@ -56,6 +101,7 @@ docker run --rm --gpus 'device=0' --network none \
   /qsa-tests/compare_qsa_prefill.py \
   --baseline-backend /qsa-evidence/baseline.py \
   --candidate-backend /qsa-evidence/candidate.py \
+  --production-geometry \
   --output /qsa-evidence/comparison.json
 ```
 

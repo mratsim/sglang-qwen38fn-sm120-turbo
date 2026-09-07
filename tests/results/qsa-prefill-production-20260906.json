@@ -1,0 +1,211 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.13.0+cu130",
+  "test_sha256": "fa2d1d7ae8b0e99f4c8699a1f7b1a9eb77fd62f21a913389145c6c046a5abd95",
+  "source_sha256": {
+    "baseline": "12c4d4d34774e5592c3a3ba3956d19a280606007e0161598e4e108bb6caa479b",
+    "candidate": "9f0fc164161c1e567cbef4583cf97ad285ddd130090a139126987253a1cec846"
+  },
+  "cases": [
+    {
+      "lengths": [
+        131072
+      ],
+      "cache_dtype": "torch.float8_e4m3fn",
+      "geometry": {
+        "query_tokens": 4096,
+        "query_heads": 24,
+        "topk": 2048
+      },
+      "measurements": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "peak_increment_bytes": {
+            "baseline": 587204096,
+            "candidate": 318768640
+          },
+          "max_abs_reference_error": {
+            "baseline": 0.0001220703125,
+            "candidate": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 6.103515625e-05,
+          "mismatched_elements": 2690,
+          "total_elements": 25165824
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "peak_increment_bytes": {
+            "candidate": 318768640,
+            "baseline": 587204096
+          },
+          "max_abs_reference_error": {
+            "candidate": 0.0001220703125,
+            "baseline": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 6.103515625e-05,
+          "mismatched_elements": 2690,
+          "total_elements": 25165824
+        }
+      ],
+      "failures": [
+        "('baseline', 'candidate'): exact equality: Tensor-likes are not equal!\n\nMismatched elements: 2690 / 25165824 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (14, 21, 18)\nGreatest relative difference: 5.0 at index (3737, 3, 126)",
+        "('candidate', 'baseline'): exact equality: Tensor-likes are not equal!\n\nMismatched elements: 2690 / 25165824 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (14, 21, 18)\nGreatest relative difference: 5.0 at index (3737, 3, 126)"
+      ]
+    },
+    {
+      "lengths": [
+        262144
+      ],
+      "cache_dtype": "torch.float8_e4m3fn",
+      "geometry": {
+        "query_tokens": 4096,
+        "query_heads": 24,
+        "topk": 2048
+      },
+      "measurements": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "peak_increment_bytes": {
+            "baseline": 1124075008,
+            "candidate": 587204096
+          },
+          "max_abs_reference_error": {
+            "baseline": 0.000244140625,
+            "candidate": 0.000244140625
+          },
+          "max_abs_baseline_candidate_error": 6.103515625e-05,
+          "mismatched_elements": 2867,
+          "total_elements": 25165824
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "peak_increment_bytes": {
+            "candidate": 587204096,
+            "baseline": 1124075008
+          },
+          "max_abs_reference_error": {
+            "candidate": 0.000244140625,
+            "baseline": 0.000244140625
+          },
+          "max_abs_baseline_candidate_error": 6.103515625e-05,
+          "mismatched_elements": 2867,
+          "total_elements": 25165824
+        }
+      ],
+      "failures": [
+        "('baseline', 'candidate'): exact equality: Tensor-likes are not equal!\n\nMismatched elements: 2867 / 25165824 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (37, 8, 102)\nGreatest relative difference: 2.3125 at index (3952, 4, 167)",
+        "('candidate', 'baseline'): exact equality: Tensor-likes are not equal!\n\nMismatched elements: 2867 / 25165824 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (37, 8, 102)\nGreatest relative difference: 2.3125 at index (3952, 4, 167)"
+      ]
+    },
+    {
+      "lengths": [
+        131072
+      ],
+      "cache_dtype": "torch.bfloat16",
+      "geometry": {
+        "query_tokens": 4096,
+        "query_heads": 24,
+        "topk": 2048
+      },
+      "measurements": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "peak_increment_bytes": {
+            "baseline": 587204096,
+            "candidate": 587204096
+          },
+          "max_abs_reference_error": {
+            "baseline": 0.0001220703125,
+            "candidate": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 0.0,
+          "mismatched_elements": 0,
+          "total_elements": 25165824
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "peak_increment_bytes": {
+            "candidate": 587204096,
+            "baseline": 587204096
+          },
+          "max_abs_reference_error": {
+            "candidate": 0.0001220703125,
+            "baseline": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 0.0,
+          "mismatched_elements": 0,
+          "total_elements": 25165824
+        }
+      ],
+      "failures": []
+    },
+    {
+      "lengths": [
+        262144
+      ],
+      "cache_dtype": "torch.bfloat16",
+      "geometry": {
+        "query_tokens": 4096,
+        "query_heads": 24,
+        "topk": 2048
+      },
+      "measurements": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "peak_increment_bytes": {
+            "baseline": 1124075008,
+            "candidate": 1124075008
+          },
+          "max_abs_reference_error": {
+            "baseline": 0.0001220703125,
+            "candidate": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 0.0,
+          "mismatched_elements": 0,
+          "total_elements": 25165824
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "peak_increment_bytes": {
+            "candidate": 1124075008,
+            "baseline": 1124075008
+          },
+          "max_abs_reference_error": {
+            "candidate": 0.0001220703125,
+            "baseline": 0.0001220703125
+          },
+          "max_abs_baseline_candidate_error": 0.0,
+          "mismatched_elements": 0,
+          "total_elements": 25165824
+        }
+      ],
+      "failures": []
+    }
+  ],
+  "scope": "Prefill gather/kernel only; no model, cache writes, MTP or server qualification",
+  "qualified": false
+}

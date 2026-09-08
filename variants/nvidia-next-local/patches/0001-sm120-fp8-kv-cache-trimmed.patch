@@ -1,0 +1,79 @@
+diff --git a/python/sglang/srt/layers/attention/qsa/sparse_attn.py b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
+index 15e5af5..fc3dccf 100644
+--- a/python/sglang/srt/layers/attention/qsa/sparse_attn.py
++++ b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
+@@ -96,12 +96,12 @@ def _sparse_gqa_prefill(
+             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
+             mask=valid[None, :],
+             other=0.0,
+-        )
++        ).to(q_values.dtype)
+         values = tl.load(
+             v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
+             mask=valid[:, None],
+             other=0.0,
+-        )
++        ).to(q_values.dtype)
+         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+         next_max = tl.maximum(max_value, tl.max(scores, 1))
+         alpha = tl.math.exp2(max_value - next_max)
+@@ -237,12 +237,12 @@ def _sparse_gqa_chunk_prefill(
+             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
+             mask=valid[None, :],
+             other=0.0,
+-        )
++        ).to(q_values.dtype)
+         values = tl.load(
+             v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
+             mask=valid[:, None],
+             other=0.0,
+-        )
++        ).to(q_values.dtype)
+         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+         next_max = tl.maximum(max_value, tl.max(scores, 1))
+         alpha = tl.math.exp2(max_value - next_max)
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index c6f0c04..0877a74 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -1445,22 +1445,34 @@ class QwenSparseAttnBackend(AttentionBackend):
+             )
+             return self._pad_extend_output(output, num_output_rows)
+ 
+-        # The validated chunk-prefill kernel consumes tightly packed full-context
+-        # K/V. Current-chunk K/V has already been committed to the cache above.
++        # The validated chunk-prefill kernel consumes tightly packed full-context K/V.
++        # Current-chunk K/V has already been committed to the cache above.
+         pool = self.token_to_kv_pool
+         k_buffer = pool.get_key_buffer(layer.layer_id)
+         v_buffer = pool.get_value_buffer(layer.layer_id)
+         req_to_token = self.req_to_token_pool.req_to_token
+         req_indices = forward_batch.req_pool_indices.tolist()
++        # With --kv-cache-dtype fp8_e4m3 this path receives an fp8 KV buffer.
++        # tl.dot inside sparse_gqa_fwd_interface_triton_ck rejects fp8 rhs operands
++        # ("Unsupported rhs dtype fp8e4nv"), so the selected rows are cast to the query dtype.
++        # TODO: assumes the direct-cast e4m3 store, KV scale 1.0.
++        # If a checkpoint ships per-layer KV descale, apply those scales here.
++        _kv_cast = (
++            (lambda t: t.to(q.dtype)) if k_buffer.dtype != q.dtype else (lambda t: t)
++        )
+         k_parts = [
+-            k_buffer.index_select(
+-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++            _kv_cast(
++                k_buffer.index_select(
++                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++                )
+             )
+             for i in range(len(sequence_lens))
+         ]
+         v_parts = [
+-            v_buffer.index_select(
+-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++            _kv_cast(
++                v_buffer.index_select(
++                    0, req_to_token[req_indices[i], : sequence_lens[i]].long()
++                )
+             )
+             for i in range(len(sequence_lens))
+         ]

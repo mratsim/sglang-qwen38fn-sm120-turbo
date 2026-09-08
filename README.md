@@ -75,6 +75,10 @@ curl -s localhost:30000/health
 
 Keep your own variants in `internal/`: the folder ships empty and everything in it is git-ignored, so a customized launcher (`internal/serve_my.sh`, host paths, bench settings) lives beside the stack without ever being committed or published.
 
+For the NVIDIA ModelOpt checkpoint on the newer
+`dev-cu13-qwen38-next-local` base, see
+[`variants/nvidia-next-local`](variants/nvidia-next-local/README.md).
+
 ## Acknowledgements
 
 While I choose different solutions, a significant amount of work has gone into both quant and tuning inference engines.

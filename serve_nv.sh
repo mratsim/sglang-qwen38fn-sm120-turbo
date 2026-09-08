@@ -1,6 +1,7 @@
 #!/bin/bash
 # Qwen3.8-Flash-Next — NVIDIA NVFP4 on RTX PRO 6000 (sm_120), TP=1.
-# Image: ./Dockerfile in this variant directory.
+# NVIDIA checkpoint launcher for the shared next-local image.
+# Image: variants/nvidia-next-local/Dockerfile.
 # SGLANG_SM120_ONLINE_MXFP8 is read by the patched image only; stock SGLang ignores it.
 
 set -euo pipefail

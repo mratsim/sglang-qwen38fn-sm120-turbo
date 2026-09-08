@@ -83,7 +83,9 @@ and checkpoint metadata differ from the default r22 stack. It was validated on
 one RTX PRO 6000 with online MXFP8, FP8 KV cache, NEXTN/RecoverSSM,
 `extra_buffer_lazy`, and a 30 GB hierarchical cache. NVIDIA NVFP4 MoE requires
 `flashinfer_cutlass` for both the target and speculative runners; the variant
-launcher sets both explicitly.
+launcher sets both explicitly. The same next-local image can serve RadixArk;
+the checkpoint-specific NVIDIA command is kept in the separate
+[`serve_nv.sh`](serve_nv.sh) script.
 
 ## Acknowledgements
 

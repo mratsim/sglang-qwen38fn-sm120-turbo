@@ -29,13 +29,16 @@ docker build \
 
 ## Serve
 
-Edit the image tag and cache paths at the top of `serve.sh`, then run:
+The image supports both the RadixArk and NVIDIA checkpoints. Keep the existing
+RadixArk launcher for RadixArk, and use this separate NVIDIA launcher for the
+ModelOpt mixed checkpoint. Edit the image tag and cache paths at the top of
+the root `serve_nv.sh`, then run:
 
 ```bash
-./variants/nvidia-next-local/serve.sh
+./serve_nv.sh
 ```
 
-The launcher follows the same layout as the root example and prints its fully
+The NVIDIA launcher follows the same layout as the root example and prints its fully
 assembled environment and server command before starting the container. Its
 validated defaults are:
 

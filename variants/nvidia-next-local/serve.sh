@@ -142,6 +142,8 @@ SERVER_ARGS=(
         --tp "${TP_SIZE}"
         # Quantization
         --quantization "${QUANTIZATION}"
+        --moe-runner-backend flashinfer_cutlass
+        --speculative-moe-runner-backend flashinfer_cutlass
         "${KV_ARGS[@]}"
         "${HICACHE_ARGS[@]}"
         # Context / memory

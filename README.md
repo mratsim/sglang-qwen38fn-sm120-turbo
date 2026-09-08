@@ -78,6 +78,12 @@ Keep your own variants in `internal/`: the folder ships empty and everything in 
 For the NVIDIA ModelOpt checkpoint on the newer
 `dev-cu13-qwen38-next-local` base, see
 [`variants/nvidia-next-local`](variants/nvidia-next-local/README.md).
+That variant has a separate Dockerfile and launcher because its source layout
+and checkpoint metadata differ from the default r22 stack. It was validated on
+one RTX PRO 6000 with online MXFP8, FP8 KV cache, NEXTN/RecoverSSM,
+`extra_buffer_lazy`, and a 30 GB hierarchical cache. NVIDIA NVFP4 MoE requires
+`flashinfer_cutlass` for both the target and speculative runners; the variant
+launcher sets both explicitly.
 
 ## Acknowledgements
 

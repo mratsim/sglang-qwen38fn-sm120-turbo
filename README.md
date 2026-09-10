@@ -8,6 +8,9 @@ Serving stack for **Qwen3.8-Flash-Next** on 96 GiB VRAM (1x RTX Pro 6000, might 
 Qwen3.8-Flash-Next is a highly performant LLM that serves as a preview for the future Qwen4 family.
 Despite being undertrained, and having very few active parameters and a small size (125B + 6B active + 51B of offloadable embedding table), benchmarks show performance comparable to closed-source LLMs from just 3 months ago (e.g. Opus 4.8).
 
+> [!TIP]
+> *Monitor your server with [`sgtop`](https://github.com/mratsim/sgtop), my sglang dedicated monitoring tool.*
+
 ## Numbers
 
 On the NVFP4 checkpoint [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4), served by the day-0 SGLang image:

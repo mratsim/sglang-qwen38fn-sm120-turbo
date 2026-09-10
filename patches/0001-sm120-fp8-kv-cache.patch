@@ -1,17 +1,5 @@
-From 3fd0e6b3f545f34e1fd278b561bfbe9fb6edb2ea Mon Sep 17 00:00:00 2001
-From: test <test@test>
-Date: Thu, 3 Sep 2026 09:24:54 +0000
-Subject: SM120 fp8 KV cache end-to-end (QSA, indexer)
-
-Covers QSA cache casting, the indexer, and page sizing, so the fp8
-cache is consistent from allocation through read.
----
- .../srt/layers/attention/qsa/sparse_attn.py   |  8 ++--
- .../attention/qwen_sparse_attn_backend.py     | 39 +++++++++++++------
- 2 files changed, 31 insertions(+), 16 deletions(-)
-
 diff --git a/python/sglang/srt/layers/attention/qsa/sparse_attn.py b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
-index 15e5af56c2..fc3dccf4bb 100644
+index 15e5af5..fc3dccf 100644
 --- a/python/sglang/srt/layers/attention/qsa/sparse_attn.py
 +++ b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
 @@ -96,12 +96,12 @@ def _sparse_gqa_prefill(
@@ -45,35 +33,10 @@ index 15e5af56c2..fc3dccf4bb 100644
          next_max = tl.maximum(max_value, tl.max(scores, 1))
          alpha = tl.math.exp2(max_value - next_max)
 diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-index 7758a88fea..15a31460d5 100644
+index c6f0c04..0877a74 100644
 --- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
 +++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-@@ -47,15 +47,18 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
- 
- @lru_cache(maxsize=1)
- def _resolve_trtllm_sparse_decode():
--    """trtllm-gen paged decode for the post-gather sparse attention.
-+    """Select the FlashInfer trtllm batch-decode kernel for sparse decode.
- 
--    On Blackwell the FA4 cute varlen fallback runs a prefill-shaped kernel
--    at decode row counts; the trtllm-gen decode kernel over a page-aligned
--    scratch measures ~35% faster for the gather+attention pair.
-+    Without it, Blackwell decode falls back to the FA4 cute varlen kernel. That kernel is shaped
-+    for prefill rows and slow at decode row counts. The trtllm API is paged, so the gathered
-+    top-k rows are stored in fixed-size pages of _TRTLLM_SPARSE_PAGE_SIZE tokens.
-+    Returns the kernel, or None when the device is not SM100/SM12x or flashinfer cannot be imported.
-     """
--    from sglang.srt.utils import is_sm100_supported
-+    from sglang.srt.utils import is_sm100_supported, is_sm120_supported
- 
--    if not is_sm100_supported():
-+    # SM100 (datacenter Blackwell) and SM12x (consumer Blackwell).
-+    # is_sm120_supported() also carries the CUDA 12.8 floor the trtllm runtime needs.
-+    if not (is_sm100_supported() or is_sm120_supported()):
-         return None
-     try:
-         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-@@ -1463,22 +1466,34 @@ class QwenSparseAttnBackend(AttentionBackend):
+@@ -1445,22 +1445,34 @@ class QwenSparseAttnBackend(AttentionBackend):
              )
              return self._pad_extend_output(output, num_output_rows)
  
@@ -114,6 +77,3 @@ index 7758a88fea..15a31460d5 100644
              )
              for i in range(len(sequence_lens))
          ]
--- 
-2.55.0
-

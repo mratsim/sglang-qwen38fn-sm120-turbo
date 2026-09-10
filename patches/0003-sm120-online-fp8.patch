@@ -1,25 +1,6 @@
-From 6e3176f72b2412bb8dde4d74c60a3ee33914bfa5 Mon Sep 17 00:00:00 2001
-From: test <test@test>
-Date: Thu, 3 Sep 2026 09:24:54 +0000
-Subject: SM120 online FP8: linears to MXFP8 at load
-
-The hook converts unquantized linears to MXFP8 at construction.
-HyperConnect rides the same rail.
----
- .../kernels/ops/gemm/sm120_online_fp8.py      | 330 ++++++++++++++++++
- python/sglang/srt/environ.py                  |  26 +-
- python/sglang/srt/layers/hc_mix_triton.py     |  78 ++++-
- python/sglang/srt/layers/hyperconnection.py   |  35 +-
- python/sglang/srt/layers/logits_processor.py  |  29 +-
- .../srt/layers/quantization/fp8_utils.py      |  20 +-
- .../sglang/srt/layers/quantization/unquant.py |  13 +
- python/sglang/srt/models/qwen4_exp.py         | 193 +++++++++-
- 8 files changed, 694 insertions(+), 30 deletions(-)
- create mode 100644 python/sglang/kernels/ops/gemm/sm120_online_fp8.py
-
 diff --git a/python/sglang/kernels/ops/gemm/sm120_online_fp8.py b/python/sglang/kernels/ops/gemm/sm120_online_fp8.py
 new file mode 100644
-index 0000000000..fc7b5ab4c3
+index 0000000..fc7b5ab
 --- /dev/null
 +++ b/python/sglang/kernels/ops/gemm/sm120_online_fp8.py
 @@ -0,0 +1,330 @@
@@ -354,10 +335,10 @@ index 0000000000..fc7b5ab4c3
 +        out[:, i : i + w_bf.shape[0]] = hidden_states @ w_bf.t()
 +    return out
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 2d7150ba0b..8a7ea108a0 100644
+index b1dd634..cd9d244 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -954,15 +954,25 @@ class Envs:
+@@ -964,15 +964,25 @@ class Envs:
          32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
      )
  
@@ -387,7 +368,7 @@ index 2d7150ba0b..8a7ea108a0 100644
      SGLANG_HC_MIX_CUDA = EnvBool(True)
      # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
      SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
-@@ -1031,9 +1041,9 @@ class Envs:
+@@ -1043,9 +1053,9 @@ class Envs:
      # otherwise.
      SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
  
@@ -399,7 +380,7 @@ index 2d7150ba0b..8a7ea108a0 100644
      SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
      SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
      # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
-@@ -1048,9 +1058,7 @@ class Envs:
+@@ -1060,9 +1070,7 @@ class Envs:
      SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
      SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
  
@@ -411,7 +392,7 @@ index 2d7150ba0b..8a7ea108a0 100644
      SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
      # Opt-in: route DeepSeek-V3 grouped topk through the unified Triton router
 diff --git a/python/sglang/srt/layers/hc_mix_triton.py b/python/sglang/srt/layers/hc_mix_triton.py
-index eae575f143..d3cfa97c74 100644
+index 734ad2f..b6ae6ff 100644
 --- a/python/sglang/srt/layers/hc_mix_triton.py
 +++ b/python/sglang/srt/layers/hc_mix_triton.py
 @@ -48,6 +48,8 @@ def _hc_mix_persistent_kernel(
@@ -531,8 +512,8 @@ index eae575f143..d3cfa97c74 100644
  
  
  def fused_hc_mix(
-@@ -221,13 +278,21 @@ def fused_hc_mix(
-     )
+@@ -219,13 +276,21 @@ def fused_hc_mix(
+     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
      if rows == 0:
          return out
 +    fp8 = _maybe_fp8_weights(w_down, w_up)
@@ -555,7 +536,7 @@ index eae575f143..d3cfa97c74 100644
          k,
          lowrank,
          hs,
-@@ -240,6 +305,7 @@ def fused_hc_mix(
+@@ -238,6 +303,7 @@ def fused_hc_mix(
          BLOCK_K=256,
          BLOCK_J=32,
          BLOCK_R=64,
@@ -564,10 +545,10 @@ index eae575f143..d3cfa97c74 100644
      )
      return out
 diff --git a/python/sglang/srt/layers/hyperconnection.py b/python/sglang/srt/layers/hyperconnection.py
-index 30f7e83008..128afb3415 100644
+index 654a0a6..9c81d99 100644
 --- a/python/sglang/srt/layers/hyperconnection.py
 +++ b/python/sglang/srt/layers/hyperconnection.py
-@@ -137,28 +137,41 @@ class GatedResidual(HyperConnectionBase):
+@@ -135,28 +135,41 @@ class GatedResidual(HyperConnectionBase):
          )
  
          if use_mix:
@@ -613,7 +594,7 @@ index 30f7e83008..128afb3415 100644
                  and torch.cuda.get_device_capability()[0] == 10
                  and (self.hc_count * self.hidden_size) % 2048 == 0
                  and self.hidden_size % 8 == 0
-@@ -279,10 +292,20 @@ class GatedResidual(HyperConnectionBase):
+@@ -277,10 +290,20 @@ class GatedResidual(HyperConnectionBase):
                  self.hidden_size,
              ).to(self.params_dtype)
          else:
@@ -637,7 +618,7 @@ index 30f7e83008..128afb3415 100644
                  self.hidden_size,
              ).to(self.params_dtype)
 diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
-index 7cea446d9c..d1108e7eae 100644
+index 7cea446..d1108e7 100644
 --- a/python/sglang/srt/layers/logits_processor.py
 +++ b/python/sglang/srt/layers/logits_processor.py
 @@ -737,9 +737,32 @@ class LogitsProcessor(nn.Module):
@@ -677,7 +658,7 @@ index 7cea446d9c..d1108e7eae 100644
              # GGUF models
              # TODO: use weight_packed_linear for GGUF models
 diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
-index 4e1060fd95..5b5ab86aa6 100755
+index 4e1060f..5b5ab86 100755
 --- a/python/sglang/srt/layers/quantization/fp8_utils.py
 +++ b/python/sglang/srt/layers/quantization/fp8_utils.py
 @@ -3,7 +3,14 @@ from __future__ import annotations
@@ -722,7 +703,7 @@ index 4e1060fd95..5b5ab86aa6 100755
              is_blackwell_supported()
              and is_flashinfer_available()
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 679c2a4b90..c355d1650c 100644
+index c0cf4fc..4c9b571 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
 @@ -195,6 +195,18 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
@@ -744,7 +725,7 @@ index 679c2a4b90..c355d1650c 100644
      _BF16_GEMM_BACKEND = backend
  
  
-@@ -390,6 +402,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
+@@ -386,6 +398,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                  return output.view(*x_shapes[:-1], -1)
              return F.linear(x, layer.weight, bias)
  
@@ -753,10 +734,10 @@ index 679c2a4b90..c355d1650c 100644
  
      def apply_into(
 diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
-index 93b552ee1c..8e76d57c46 100644
+index fa982a2..eeda089 100644
 --- a/python/sglang/srt/models/qwen4_exp.py
 +++ b/python/sglang/srt/models/qwen4_exp.py
-@@ -747,11 +747,15 @@ def _gather_ple_embedding_from_pinned_kernel(
+@@ -774,11 +774,15 @@ def _gather_ple_embedding_from_pinned_kernel(
      )
  
  
@@ -765,7 +746,7 @@ index 93b552ee1c..8e76d57c46 100644
 +
 +
  class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-     """PLE table read directly from pinned host memory.
+     """PLE table read directly from host memory (pinned, or a file-backed mmap).
  
 -    The table stays in its checkpoint storage dtype (fp8 with a per-tensor
 -    weight_scale for fp8 checkpoints, bf16 otherwise); gathers emit bf16.
@@ -774,7 +755,7 @@ index 93b552ee1c..8e76d57c46 100644
      """
  
      _COPIED_ATTRIBUTES = (
-@@ -1218,6 +1222,26 @@ class Qwen4ExpPLELayer(nn.Module):
+@@ -1268,6 +1272,26 @@ class Qwen4ExpPLELayer(nn.Module):
          return _pad_token_rows(output, batch.physical_tokens)
  
  
@@ -801,7 +782,7 @@ index 93b552ee1c..8e76d57c46 100644
  class Qwen4ExpLayerExtensionMixin:
      def _init_qwen4_exp_layer_extensions(
          self,
-@@ -1272,6 +1296,91 @@ class Qwen4ExpLayerExtensionMixin:
+@@ -1322,6 +1346,91 @@ class Qwen4ExpLayerExtensionMixin:
              use_mix=True,
              use_combine=True,
          )
@@ -893,7 +874,7 @@ index 93b552ee1c..8e76d57c46 100644
  
      def _prepare_qwen4_exp_attn(
          self,
-@@ -1776,6 +1885,72 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1826,6 +1935,72 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
          loaded_buffers.add(name)
          return True
  
@@ -966,7 +947,7 @@ index 93b552ee1c..8e76d57c46 100644
      def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
          stacked_params_mapping = [
              ("qkv_proj", "q_proj", "q"),
-@@ -1887,7 +2062,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1937,7 +2112,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                          'text_config.ple_embedding_dtype="float8_e4m3fn" instead'
                      )
                  logger.info(
@@ -975,7 +956,7 @@ index 93b552ee1c..8e76d57c46 100644
                      mod_prefix,
                      tuple(emb.weight.data.shape),
                  )
-@@ -1910,7 +2085,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1960,7 +2135,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                  if not getattr(load_qwen4_exp_ple_shard, "_warned_downcast", False):
                      load_qwen4_exp_ple_shard._warned_downcast = True
                      logger.warning(
@@ -984,7 +965,7 @@ index 93b552ee1c..8e76d57c46 100644
                          "is fp8 (ple_embedding_dtype / fp8 quant config); "
                          "downcasting is lossy",
                          loaded_weight.dtype,
-@@ -1925,6 +2100,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1975,6 +2150,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
              loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
              return True
  
@@ -992,7 +973,7 @@ index 93b552ee1c..8e76d57c46 100644
          params_dict = dict(self.named_parameters(remove_duplicate=False))
          buffers = dict(self.named_buffers())
  
-@@ -1946,6 +2122,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -1996,6 +2172,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
          loaded_shard_params: Set[str] = set()
          skipped_visual_count = 0
  
@@ -1000,7 +981,7 @@ index 93b552ee1c..8e76d57c46 100644
          for name, loaded_weight in weights:
              if "rotary_emb.inv_freq" in name:
                  continue
-@@ -2115,6 +2292,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+@@ -2165,6 +2342,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
              if isinstance(module, Qwen3_5GatedDeltaNet):
                  module.finalize_fused_in_proj()
  
@@ -1015,6 +996,3 @@ index 93b552ee1c..8e76d57c46 100644
          return loaded_params
  
      @classmethod
--- 
-2.55.0
-

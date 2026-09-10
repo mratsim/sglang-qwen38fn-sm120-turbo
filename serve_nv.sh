@@ -1,7 +1,8 @@
 #!/bin/bash
-# Qwen3.8-Flash-Next NVFP4 on RTX PRO 6000 (sm_120, 96 GB), TP=1.
-# Image: ./Dockerfile (extends the official day-0 image with patches/).
-# SGLANG_SM120_ONLINE_MXFP8 is read by this image only, stock sglang ignores it.
+# Qwen3.8-Flash-Next — NVIDIA NVFP4 on RTX PRO 6000 (sm_120), TP=1.
+# NVIDIA checkpoint launcher for the shared next-local image.
+# Image: ./Dockerfile.
+# SGLANG_SM120_ONLINE_MXFP8 is read by the patched image only; stock SGLang ignores it.
 
 set -euo pipefail
 
@@ -9,40 +10,27 @@ set -euo pipefail
 # Container setup
 # ============================================================
 IMAGE="localhost/sglang-qwen38fn-sm120-turbo:next-local"
-PODNAME="sglang"
-SGLANG_PORT=30000
+PODNAME="sglang-qwen38fn-nv"
+SGLANG_PORT=8000
 
 # ============================================================
 # Paths
 # ============================================================
-HF_CACHE="${HOME}"/.cache/huggingface
-LOCAL_MODELS="${HOME}"/models
+MODELSCOPE_CACHE="/mnt/data/gpustack-data/cache/model_scope"
+HF_CACHE="${HOME}/.cache/huggingface"
 
 DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
-SGL_CACHE="${DIR}/cache-sglang"
+SGL_CACHE="${DIR}/cache-sglang-nv"
 
-mkdir -p "${HF_CACHE}" "${LOCAL_MODELS}" "${SGL_CACHE}"/{sglang-generated,triton,tilelang}
+mkdir -p "${SGL_CACHE}"/{sglang-generated,triton,tilelang}
 
 # ============================================================
 # Checkpoint
 # ============================================================
 MODELNAME="Qwen3.8-Flash-Next"
-MODEL_SOURCE=local             # hf: resolve the id on first boot (downloads to ${HF_CACHE})
-                               # local: read ${LOCAL_MODELS}/<dir>, no downloads
-OFFLINE_MODE=true              # TRANSFORMERS_OFFLINE=1 and HF_HUB_OFFLINE=1 inside the container, nothing reaches the Hub
-                               # an hf boot with a cold cache needs it false to download
-
-CHECKPOINT=radixark
-MODEL_HF="RadixArk/Qwen3.8-Flash-Next-NVFP4"
-MODEL_DIR="RadixArk-Qwen3.8-Flash-Next-NVFP4"
-QUANTIZATION=modelopt_fp4
-ONLINE_MXFP8=true              # This checkpoint ships its linears in bf16, quantized at load.
-
-case "${MODEL_SOURCE}" in
-  hf)    MODEL="${MODEL_HF}" ;;
-  local) MODEL="${LOCAL_MODELS}/${MODEL_DIR}" ;;
-  *) echo 'MODEL_SOURCE must be hf or local' >&2; exit 2 ;;
-esac
+MODEL_DIR="nv-community/Qwen3.8-Flash-Next-NVFP4"
+QUANTIZATION=modelopt_mixed
+OFFLINE_MODE=true
 
 # ============================================================
 # Tuning knobs
@@ -50,23 +38,23 @@ esac
 TP_SIZE=1
 
 GPU_UTIL=0.975              # --mem-fraction-static, ~76K KV tokens per 0.01.
-                            # 0.975 leaves about ~475MB spare out of 96GiB
-                            # Images preprocess on the device and need ~100 MB each.
-                            # JIT-ed Triton kernels also use spare VRAM
+                            # Image preprocessing and JIT kernels need spare VRAM.
 CONTEXT_SIZE=262144
 KVFP8=true
 
-MAX_RUNNING=4
+ONLINE_MXFP8=true           # Quantize otherwise-unquantized linears at load on SM120.
+
+MTP=true
+GDN_MTP_CACHE_MODE=none     # none: RecoverSSM recomputes the accepted state after verify.
+                            # full: retain one state copy per draft token.
+
+MAX_RUNNING=12
 CHUNKED_PREFILL=4096
 
-MTP=true                          # MTP-3 speculation (3 steps / topk 1 / 4 drafts)
-GDN_MTP_CACHE_MODE=none           # none: saves no state copies during MTP verification (~2 GB freed). The accepted state is recomputed after verify.
-                                  # full: sglang's stock behavior, copies the state per draft token so verification can restore any accepted prefix.
-
 HICACHE=true
-HICACHE_SIZE=32                   # GB of pinned host RAM for evicted prefixes, on top of the ~51 GB host PLE table (192 GiB host)
+HICACHE_SIZE=30             # GB of pinned host RAM, in addition to the host PLE table.
 
-DEFAULT_REASONING_EFFORT="medium" # xhigh | medium | low, per-request chat_template_kwargs wins
+DEFAULT_REASONING_EFFORT="medium" # xhigh | medium | low; per-request kwargs win.
 
 # ============================================================
 # Guards
@@ -90,14 +78,12 @@ ENV_VARS=(
     SAFETENSORS_FAST_GPU=1
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1
     OMP_NUM_THREADS=1
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # Required: fragmentation without it costs up to ~373K KV tokens
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True # Avoid allocator fragmentation.
+    SGLANG_AUTO_NUMA_BIND=false
     SGLANG_SM120_ONLINE_MXFP8="${ONLINE_MXFP8}"
     XDG_CACHE_HOME=/root/.cache
     SGLANG_CACHE_DIR=/root/.cache/sglang-generated
 )
-if [[ "${MODEL_SOURCE}" == local ]]; then
-    OFFLINE_MODE=true
-fi
 if [[ "${OFFLINE_MODE}" == true ]]; then
     ENV_VARS+=(TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1)
 fi
@@ -118,27 +104,16 @@ if [[ "${HICACHE}" == true ]]; then
     HICACHE_ARGS+=(--enable-hierarchical-cache --hicache-size "${HICACHE_SIZE}" --hicache-write-policy write_through)
 fi
 
-# Preflight: decide from the host whether the weights are there before a container
-# can freeze on a download and get killed by the health check into a restart loop.
-if [[ "${MODEL_SOURCE}" == local ]]; then
-    if ! find "${LOCAL_MODELS}/${MODEL_DIR}" -maxdepth 1 -name "*.safetensors" -print -quit 2>/dev/null | grep -q .; then
-        echo "MODEL_SOURCE=local: no .safetensors under ${LOCAL_MODELS}/${MODEL_DIR}" >&2
-        echo "place the snapshot there first, or boot with MODEL_SOURCE=hf to download it" >&2
-        exit 2
-    fi
-    MODEL_PATH="/workspace/local_models/${MODEL_DIR}"
-else
-    if ! find "${HF_CACHE}/hub" -path "*--$(tr '[:lower:]' '[:upper:]' <<< "${MODEL_HF%%/*}")--$(tr '[:lower:]' '[:upper:]' <<< "${MODEL_HF##*/}")" -prune -name "*.safetensors" -print -quit 2>/dev/null | grep -q .; then
-        echo "note: ${MODEL_HF} is not in ${HF_CACHE}, first boot downloads the full checkpoint" >&2
-        [[ "${OFFLINE_MODE}" == true ]] && echo "OFFLINE_MODE=true blocks that download, set it false for a cold-cache hf boot" >&2
-    fi
-    MODEL_PATH="${MODEL}"
+# Preflight: fail before starting a container if the offline snapshot is absent.
+if ! find "${MODELSCOPE_CACHE}/${MODEL_DIR}" -maxdepth 1 -name "*.safetensors" -print -quit 2>/dev/null | grep -q .; then
+    echo "no .safetensors under ${MODELSCOPE_CACHE}/${MODEL_DIR}" >&2
+    exit 2
 fi
+MODEL_PATH="/workspace/local_models/${MODEL_DIR}"
 
 # ============================================================
-# Server command (single source: the recap prints it, podman runs it)
+# Server command (single source: the recap prints it, Docker runs it)
 # ============================================================
-shift || true  # discard the script name before the "$@" passthrough
 
 SERVER_ARGS=(
     sglang serve
@@ -168,6 +143,8 @@ SERVER_ARGS=(
         --tp "${TP_SIZE}"
         # Quantization
         --quantization "${QUANTIZATION}"
+        --moe-runner-backend flashinfer_cutlass
+        --speculative-moe-runner-backend flashinfer_cutlass
         "${KV_ARGS[@]}"
         "${HICACHE_ARGS[@]}"
         # Context / memory
@@ -184,6 +161,8 @@ SERVER_ARGS=(
         --enable-cache-report
         # Idle behavior
         --sleep-on-idle
+        # Multimodal limits
+        --limit-mm-data-per-request '{"image":4}'
         "$@"
 )
 
@@ -191,8 +170,8 @@ SERVER_ARGS=(
 # Launch recap
 # ============================================================
 {
-  printf 'launch %s as %s\n' "${MODEL}" "${MODELNAME}"
-  printf '  checkpoint       %s (%s)\n' "${CHECKPOINT}" "${MODEL_SOURCE}"
+  printf 'launch %s as %s\n' "${MODEL_PATH}" "${MODELNAME}"
+  printf '  checkpoint       nvidia (modelscope, local)\n'
   printf '  offline          %s\n' "$([ "${OFFLINE_MODE}" == true ] && echo on || echo off)"
   printf '  image            %s\n' "${IMAGE}"
   printf '  pod / port       %s / %s\n' "${PODNAME}" "${SGLANG_PORT}"
@@ -217,12 +196,11 @@ for kv in "${ENV_VARS[@]}"; do
     ENV_ARGS+=(-e "${kv}")
 done
 
-podman run --replace --detach --restart always \
+docker run --detach --restart always \
     --health-cmd="curl -f http://localhost:${SGLANG_PORT}/health || exit 1" \
-    --health-start-period=300s \
+    --health-start-period=600s \
     --health-interval=30s \
-    --health-retries=10 \
-    --health-on-failure=kill \
+    --health-retries=20 \
     --name "${PODNAME}" \
     --device nvidia.com/gpu=all \
     --network=host \
@@ -231,7 +209,9 @@ podman run --replace --detach --restart always \
     -v "${SGL_CACHE}/sglang-generated:/root/.cache/sglang-generated" \
     -v "${SGL_CACHE}/triton:/root/.triton" \
     -v "${SGL_CACHE}/tilelang:/root/.cache/tilelang" \
-    -v "${LOCAL_MODELS}":/workspace/local_models:ro \
+    -v "${MODELSCOPE_CACHE}":/workspace/local_models:ro \
     -v "${HF_CACHE}":/root/.cache/huggingface:rw \
     "${IMAGE}" \
     "${SERVER_ARGS[@]}"
+
+echo "started ${PODNAME}; follow with: docker logs -f ${PODNAME}; health: curl -s localhost:${SGLANG_PORT}/health"

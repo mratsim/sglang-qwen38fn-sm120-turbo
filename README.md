@@ -48,30 +48,81 @@ On the NVFP4 checkpoint [`RadixArk/Qwen3.8-Flash-Next-NVFP4`](https://huggingfac
 
 ## Behind-the-scenes
 
-This builds on top of the day-0 official Docker image `lmsysorg/sglang:qwen38flashnext`:
+This builds on the pinned `lmsysorg/sglang:dev-cu13-qwen38-next-local`
+image at SGLang commit `4ccff141dbe992794f9da6c3aa23535b4f72000d`.
+The resulting image supports both the RadixArk and NVIDIA ModelOpt checkpoints:
 
 - **0001** makes fp8 KV cache work on sm_120.
 - **0002** linear-attention layers don't cache MTP drafts, they are recomputed. Saves ~2 GB of KV budget. (And it's surprisingly not slower)
 - **0003** quantizes at load whatever the checkpoint left in bf16 (attention, MLP, lm_head, hyperconnection mix) to MXFP8 to reduce memory bandwidth at close to zero-accuracy cost. On FlashInfer 0.6.18, this should be even faster as FlashInfer 0.6.18 integrates [`local-inference-lab/b12x`](https://github.com/local-inference-lab/b12x) and its hardware-accelerated block-scaled GEMM kernel.
-- **0004** prepares support for https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4 which has a calibration dataset richer than CNN/DailyMail. This is important to get proper scales for NVFP4 activations so signal isn't lost due to oversaturation because the calibration scale doesn't represent actual maximum in diverse user workflows.
 - **0005** keeps abandoned runs from eating the machine: an aborted or timed-out client now really evicts its request, and no longer starves the queue behind it.
 - **0006** stops the sampler from using NNCL when the server has a single GPU. This was a bug or an oversight in structured JSON decoding, that led to extra GPU memory utilization.
 - **0007** Preload triton kernels at boot via long prefill warmup and structure decoding warmup to ensure reserved GPU memory is sufficient and server doesn't crash in the middle of queries.
+- **0008** removes a self-reference in the PLE shard loader. Its closure retained
+  the loading-time parameter dictionary, keeping replaced MoE scale buffers and
+  the old BF16 `lm_head` alive until cyclic GC. On the tested NVIDIA checkpoint
+  with online MXFP8, those stale tensors total 8.215 GiB. They can now be
+  released during loading.
+
+Earlier release changes when memory becomes available; it does not remove
+additional resident model weights. Automatic KV sizing can use the reclaimed
+space. To retain GPU headroom, set an explicit total KV token cap, for example
+`./serve_nv.sh --max-total-tokens 570048`. This caps the shared cache capacity,
+not the per-request context length. MTP also needs its own model, KV, and graphs.
 
 ## Build and serve
 
-Modify the top of `serve_sglang_qwen3.8-flash-next-example.sh` for your machine:
+Build the shared image from the repository root:
+
+```bash
+podman build -t localhost/sglang-qwen38fn-sm120-turbo:next-local .
+```
+
+Use `serve_sglang_qwen3.8-flash-next-example.sh` for the RadixArk checkpoint,
+or `serve_nv.sh` for the NVIDIA checkpoint. Modify the selected script's image
+tag, cache paths, and tuning knobs for your machine.
+
+The RadixArk launcher exposes:
 - `IMAGE`: tag you built below
-- `CHECKPOINT`: `radixark` (validated) or `lil` (WIP)
 - `MODEL_SOURCE`: `hf` (downloads to `HF_CACHE`) or `local` (reads `LOCAL_MODELS/<dir>` offline)
 - `GPU_UTIL`, `MAX_RUNNING`, `HICACHE_SIZE`: KV fraction, concurrency, KVcache RAM offloading
 - `PODNAME`, `SGLANG_PORT`: container name and port
 
 ```bash
-podman build -t localhost/sglang-qwen38fn-sm120-turbo:r22 .
 ./serve_sglang_qwen3.8-flash-next-example.sh    # recap of the full config goes to stderr
 curl -s localhost:30000/health
 ```
+
+The NVIDIA launcher uses `nv-community/Qwen3.8-Flash-Next-NVFP4` with
+`modelopt_mixed`. It explicitly selects `flashinfer_cutlass` for both target
+and speculative NVFP4 MoE; leaving these runners on `auto` selects an
+unsupported backend on this base.
+
+```bash
+./serve_nv.sh
+curl -s localhost:8000/health
+```
+
+Its validated RTX PRO 6000 defaults include:
+
+```bash
+ONLINE_MXFP8=true
+MTP=true
+GDN_MTP_CACHE_MODE=none
+MAX_RUNNING=12
+MAMBA_CACHE=$(( 4 * MAX_RUNNING + 3 ))
+HICACHE_SIZE=30
+```
+
+The NVIDIA configuration loaded target and MTP draft weights, replaced 194
+otherwise-unquantized weights with online MXFP8, captured target verify plus
+draft decode/extend CUDA graphs, and completed a 231-token generation with a
+speculative accept length of 3.17 and accept rate of 0.72. The 30 GB
+hierarchical cache allocated 23.68 GB for KV and 6.35 GB for Mamba.
+
+With FP8 KV cache, this checkpoint currently logs that no KV scaling factors
+were provided and defaults them to 1.0. This does not prevent startup, but
+accuracy-sensitive deployments should compare it with the default KV dtype.
 
 Keep your own variants in `internal/`: the folder ships empty and everything in it is git-ignored, so a customized launcher (`internal/serve_my.sh`, host paths, bench settings) lives beside the stack without ever being committed or published.
 

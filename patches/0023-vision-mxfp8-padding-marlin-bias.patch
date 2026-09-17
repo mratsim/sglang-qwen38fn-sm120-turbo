@@ -1,0 +1,73 @@
+diff --git a/python/sglang/srt/layers/quantization/modelopt_quant.py b/python/sglang/srt/layers/quantization/modelopt_quant.py
+index 8afc2bd99d..eb40743088 100755
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -966,10 +966,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
+                 # It stays bf16 and the loader dequantizes its mxfp8 checkpoint components at load (qwen4_exp).
+                 return UnquantizedLinearMethod()
+             if quant_algo == "MXFP8":
++                if prefix.startswith(("model.visual.blocks.", "visual.blocks.")) and prefix.endswith(".mlp.linear_fc1"):
++                    from sglang.srt.layers.quantization.vision_mxfp8 import VisionMxfp8PaddedLinearMethod
++                    return VisionMxfp8PaddedLinearMethod(self.mxfp8_config)
+                 return Fp8LinearMethod(self.mxfp8_config)
+             if quant_algo == "NVFP4":
+                 return ModelOptFp4LinearMethod(self.nvfp4_config)
+             if quant_algo == "W4A16_NVFP4":
++                if prefix.startswith(("model.visual.blocks.", "visual.blocks.")) and prefix.endswith(".mlp.linear_fc2"):
++                    from sglang.srt.layers.quantization.vision_mxfp8 import VisionNvFp4A16LinearMethod
++                    return VisionNvFp4A16LinearMethod(self.nvfp4a16_config)
+                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
+             if quant_algo is None:
+                 # Early witness: fires at construction, unlike the end-of-load scale raise.
+diff --git a/python/sglang/srt/layers/quantization/vision_mxfp8.py b/python/sglang/srt/layers/quantization/vision_mxfp8.py
+new file mode 100644
+index 0000000000..607093ee96
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/vision_mxfp8.py
+@@ -0,0 +1,46 @@
++"""Shape adapter for the LIL vision FC1's N=4304 MXFP8 GEMM.
++
++Preserve serialized FP8 weights/scales and the existing activation quantizer;
++only append zero output rows for SM120 CUTLASS's N % 32 eligibility rule.
++"""
++import logging
++import torch
++from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
++
++logger = logging.getLogger(__name__)
++
++class VisionMxfp8PaddedLinearMethod(Fp8LinearMethod):
++    def process_weights_after_loading(self, layer):
++        weight = layer.weight.data
++        scales = layer.weight_scale_inv.data
++        n, k = weight.shape
++        if not self.use_mxfp8 or k % 32 or scales.shape != (n, k // 32):
++            raise ValueError('Vision MXFP8 adapter requires serialized row-major g32 weights/scales')
++        layer.vision_logical_output_size = n
++        pad = (-n) % 32
++        if pad:
++            layer.weight.data = torch.cat((weight, weight.new_zeros((pad, k))))
++            layer.weight_scale_inv.data = torch.cat((scales, scales.new_full((pad, k // 32), 127)))
++        super().process_weights_after_loading(layer)
++        logger.info('[vision-mxfp8-padding] logical_n=%d physical_n=%d k=%d', n, n + pad, k)
++
++    def apply(self, layer, x, bias=None):
++        output = super().apply(layer, x, bias=None)
++        output = output[..., :layer.vision_logical_output_size].contiguous()
++        return output if bias is None else output + bias
++
++
++from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
++
++class VisionNvFp4A16LinearMethod(ModelOptNvFp4A16LinearMethod):
++    def process_weights_after_loading(self, layer):
++        # prepare_nvfp4_layer_for_marlin permutes bias for a fused epilogue,
++        # but this version's apply_fp4_marlin_linear adds bias in logical order
++        # *after* the GEMM. Keep original bias for the vision FC2 only.
++        if layer.output_size_per_partition % 128:
++            raise ValueError('Vision FC2 bias adapter requires an unpadded output dimension')
++        bias = layer.bias.detach().clone() if layer.bias is not None else None
++        super().process_weights_after_loading(layer)
++        if bias is not None:
++            layer.bias = torch.nn.Parameter(bias, requires_grad=False)
++        logger.info('[vision-marlin-bias] restored logical-order bias n=%d', layer.output_size_per_partition)

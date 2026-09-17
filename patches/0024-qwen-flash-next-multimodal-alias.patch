@@ -1,0 +1,36 @@
+diff --git a/python/sglang/srt/multimodal/processors/qwen_vl.py b/python/sglang/srt/multimodal/processors/qwen_vl.py
+index c4e2a33c72..ee74837cd7 100644
+--- a/python/sglang/srt/multimodal/processors/qwen_vl.py
++++ b/python/sglang/srt/multimodal/processors/qwen_vl.py
+@@ -314,6 +314,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen4_exp",
++            "qwen3_8_flash_next",
+             "intern_s2_preview",
+             "interns2_mobius",
+         ):
+@@ -525,6 +526,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen4_exp",
++            "qwen3_8_flash_next",
+             "intern_s2_preview",
+             "interns2_mobius",
+         ):
+@@ -662,6 +664,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
+                 "qwen3_5",
+                 "qwen3_5_moe",
+                 "qwen4_exp",
++                "qwen3_8_flash_next",
+                 "intern_s2_preview",
+             ]
+             and video_timestamps is not None
+@@ -771,6 +774,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
+             "qwen3_5",
+             "qwen3_5_moe",
+             "qwen4_exp",
++            "qwen3_8_flash_next",
+             "intern_s2_preview",
+             "interns2_mobius",
+         ):

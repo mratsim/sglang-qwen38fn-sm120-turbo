@@ -802,7 +802,7 @@ index beea4dcf38..1a443bac6f 100644
 +        stash_per_layer = getattr(self.linear_attn_backend, "_no_cache_stash", {})
 +        if not stash_per_layer:
 +            logger.warning(
-+                "[mratsim's sm120-turbo r22] gdn recovery: stash not allocated at capture time; "
++                "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] gdn recovery: stash not allocated at capture time; "
 +                "recovery will run eagerly on the side stream (no cuda graph)."
 +            )
 +            return
@@ -902,7 +902,7 @@ index beea4dcf38..1a443bac6f 100644
 +                    self._rec_boundary_graphs[B] = gb
 +            self._rec_capture_bs = buckets
 +            logger.info(
-+                "[mratsim's sm120-turbo r22] gdn recovery: captured %d recovery cuda graphs (buckets=%s, "
++                "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] gdn recovery: captured %d recovery cuda graphs (buckets=%s, "
 +                "boundary=%s)",
 +                len(buckets),
 +                buckets,
@@ -913,7 +913,7 @@ index beea4dcf38..1a443bac6f 100644
 +            # (unsupported op in capture, cross-stream misuse). A different exception type
 +            # is a bug in this capture body and must crash: falling through to eager would hide it.
 +            logger.warning(
-+                "[mratsim's sm120-turbo r22] gdn recovery: recovery cuda graph capture failed (%s); "
++                "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] gdn recovery: recovery cuda graph capture failed (%s); "
 +                "falling back to eager side-stream recovery.",
 +                e,
 +            )

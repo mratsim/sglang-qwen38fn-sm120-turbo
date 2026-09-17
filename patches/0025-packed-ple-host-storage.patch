@@ -1,0 +1,393 @@
+diff --git a/python/sglang/srt/models/packed_ple.py b/python/sglang/srt/models/packed_ple.py
+new file mode 100644
+index 0000000..c6fb98f
+--- /dev/null
++++ b/python/sglang/srt/models/packed_ple.py
+@@ -0,0 +1,159 @@
++"""Opt-in NVFP4 PLE row gather. Host storage, GPU dequantization only on lookup.
++
++Checkpoint layout: low nibble first, E2M1; row-major E4M3 scales per 16
++columns; FP32 global scale. No scale swizzle or inverse scales.
++"""
++import torch
++import triton
++import triton.language as tl
++
++
++class PackedPLEStorage:
++    """Retain row-major checkpoint bytes; never expand a checkpoint shard."""
++
++    def __init__(self, rows, dim, *, pin_memory=True):
++        if rows <= 0 or dim <= 0 or dim % 16:
++            raise ValueError('packed PLE needs positive rows and dimension divisible by 16')
++        self.weight = torch.empty((rows, dim // 2), dtype=torch.uint8,
++                                  device='cpu', pin_memory=pin_memory)
++        self.scales = torch.empty((rows, dim // 16), dtype=torch.float8_e4m3fn,
++                                  device='cpu', pin_memory=pin_memory)
++        self.global_scale = None
++        self._ranges = []
++        self._tp_bounds = None
++        self._source_ranges = []
++
++    def validate_tp2_partition(self, emb):
++        """Validate the actual VocabParallelEmbedding padded rank interval.
++
++        Rank is encoded by padded bounds (the source embedding has no tp_rank
++        attribute). No added vocabulary or empty rank is supported here.
++        """
++        indices = emb.shard_indices
++        padded = emb.org_vocab_size_padded
++        capacity = self.weight.shape[0]
++        start = indices.padded_org_vocab_start_index
++        end = indices.padded_org_vocab_end_index
++        if (emb.tp_size != 2 or emb.num_added_embeddings != 0
++                or padded < emb.org_vocab_size or padded % 2
++                or emb.num_embeddings_padded != padded
++                or capacity != padded // 2
++                or emb.num_embeddings_per_partition != capacity
++                or start not in (0, capacity) or end != start + capacity
++                or indices.org_vocab_start_index != min(start, emb.org_vocab_size)
++                or indices.org_vocab_end_index != min(end, emb.org_vocab_size)
++                or indices.org_vocab_start_index >= indices.org_vocab_end_index):
++            raise ValueError('invalid packed PLE TP2 padded rank layout')
++
++    @property
++    def nbytes(self):
++        return self.weight.numel() + self.scales.numel()
++
++    def load(self, packed, scales, shard_start, tp_start, tp_end, global_scale):
++        import math
++        if (packed.dtype != torch.uint8 or packed.ndim != 2
++                or packed.shape[1] != self.weight.shape[1]
++                or scales.dtype != torch.float8_e4m3fn
++                or tuple(scales.shape) != (packed.shape[0], self.scales.shape[1])):
++            raise ValueError('invalid packed PLE checkpoint layout or dtype')
++        if (not math.isfinite(global_scale) or global_scale <= 0
++                or (self.global_scale is not None and self.global_scale != global_scale)):
++            raise ValueError('invalid or conflicting packed PLE global scale')
++        if not (0 <= tp_start < tp_end and tp_end-tp_start <= self.weight.shape[0]
++                and shard_start >= 0) or (self._tp_bounds is not None
++                and self._tp_bounds != (tp_start, tp_end)):
++            raise ValueError('invalid packed PLE shard bounds')
++        self._tp_bounds = (tp_start, tp_end)
++        self.global_scale = global_scale
++        self._source_ranges.append((shard_start, shard_start + packed.shape[0]))
++        start = max(shard_start, tp_start)
++        end = min(shard_start + packed.shape[0], tp_end)
++        if start < end:
++            source = slice(start - shard_start, end - shard_start)
++            target = slice(start - tp_start, end - tp_start)
++            self.weight[target].copy_(packed[source])
++            self.scales[target].copy_(scales[source])
++            self._ranges.append((start, end))
++
++    def finalize(self, tp_start, tp_end, *, expected_shards=None,
++                 expected_global_shards=None, global_rows=None):
++        if expected_global_shards is not None:
++            if len(self._source_ranges) != expected_global_shards:
++                raise ValueError('invalid packed PLE global shard count')
++            cursor = 0
++            for start, end in sorted(self._source_ranges):
++                if start != cursor or end <= start:
++                    raise ValueError('packed PLE has missing or overlapping global source rows')
++                cursor = end
++            if cursor != global_rows:
++                raise ValueError('packed PLE global source is incomplete')
++            shard_size = (global_rows + expected_global_shards - 1) // expected_global_shards
++            expected_shards = sum(
++                max(i * shard_size, tp_start) < min((i + 1) * shard_size, global_rows, tp_end)
++                for i in range(expected_global_shards))
++        if self._tp_bounds != (tp_start, tp_end):
++            raise ValueError('invalid packed PLE finalize bounds or unloaded table')
++        if expected_shards is not None and len(self._ranges) != expected_shards:
++            raise ValueError('invalid packed PLE shard count')
++        cursor = tp_start
++        for start, end in sorted(self._ranges):
++            if start != cursor:
++                raise ValueError('packed PLE has missing or overlapping rows')
++            cursor = end
++        if cursor != tp_end:
++            raise ValueError('packed PLE is incomplete')
++
++
++@triton.jit
++def gather_packed_kernel(
++    weight_ptr, scale_ptr, ids_ptr, output_ptr, global_scale,
++    embedding_dim: tl.constexpr, tp_vocab_start, tp_vocab_end,
++    fp8_reference: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    row = tl.program_id(0)
++    index = tl.load(ids_ptr + row).to(tl.int64)
++    valid = (index >= tp_vocab_start) & (index < tp_vocab_end)
++    local = tl.where(valid, index - tp_vocab_start, 0).to(tl.int64)
++    col = tl.arange(0, BLOCK_D)
++    mask = col < embedding_dim
++    weights = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
++    scales = scale_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
++    packed = tl.load(weights + local * (embedding_dim // 2) + col // 2,
++                     mask=valid & mask, other=0)
++    nibble = tl.where((col & 1) == 0, packed & 15, packed >> 4)
++    code = nibble & 7
++    magnitude = tl.where(code == 0, 0., tl.where(code == 1, .5,
++                tl.where(code == 2, 1., tl.where(code == 3, 1.5,
++                tl.where(code == 4, 2., tl.where(code == 5, 3.,
++                tl.where(code == 6, 4., 6.)))))))
++    quantized = tl.where((nibble & 8) != 0, -magnitude, magnitude)
++    scale = tl.load(scales + local * (embedding_dim // 16) + col // 16,
++                    mask=valid & mask, other=0.).to(tl.float32)
++    if fp8_reference:
++        # Match original SGLang loader multiplication order and FP8 storage
++        # rounding, then the existing pinned gather's BF16 conversion.
++        values = quantized * (scale * global_scale)
++        bits = values.to(tl.int32, bitcast=True)
++        # E4M3 RNE explicitly, including subnormals. Triton 3.7's interpreter
++        # mishandles subnormal downcasts; using exact power-of-two steps also
++        # makes the reference path independent of GPU satfinite conversion.
++        step_bits = tl.maximum(((bits >> 23) & 255) - 3, 118) << 23
++        step = step_bits.to(tl.float32, bitcast=True)
++        units = tl.abs(values) / step
++        lower = units.to(tl.int32)
++        fraction = units - lower
++        rounded = (lower + ((fraction > .5) | ((fraction == .5) & ((lower & 1) != 0))).to(tl.int32)) * step
++        # This image's PyTorch float8_e4m3fn cast saturates finite overflow.
++        rounded = tl.where(values != values, float("nan"), tl.minimum(rounded, 448.))
++        # LLVM's no-signed-zeros algebra can erase E2M1 -0 during multiplies.
++        # Restore the checkpoint sign explicitly for bitwise legacy agreement.
++        sign = ((nibble.to(tl.int32) & 8) << 28) ^ (scale.to(tl.int32, bitcast=True) & -2147483648)
++        values = (rounded.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
++    else:
++        # Explicit BF16 RNE (also avoids Triton interpreter's BF16 truncation).
++        values = quantized * scale * global_scale
++        bits = values.to(tl.int32, bitcast=True)
++        bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & -65536
++        values = bits.to(tl.float32, bitcast=True)
++    tl.store(output_ptr + row.to(tl.int64) * embedding_dim + col,
++             tl.where(valid, values, 0.), mask=mask)
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 15bbe70..529b482 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -522,19 +522,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         # nibbles with one e4m3 scale per 16 values. The loader dequantizes each
+         # shard pair when both keys arrived.
+         self._ple_source_packed = ple_embedding_dtype == "nvfp4"
++        self._ple_packed_host = _ple_packed_host_wanted(config)
+         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
+-        self.ngram_embedding = VocabParallelEmbedding(
+-            padded_vocab_size,
+-            self.head_dim_per_ngram,
+-            params_dtype=(
+-                torch.float8_e4m3fn
+-                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+-                or ple_embedding_dtype == "nvfp4"
+-                else torch.bfloat16
+-            ),
+-            output_dtype=torch.bfloat16,
+-            use_attn_tp_group=self.use_attn_tp_ngram,
+-        )
++        # Packed mode needs only this module's TP/shape metadata; allocating the fp8
++        # table here would spike VRAM by the per-rank shard just to free it in the wrapper.
++        with torch.device("meta") if self._ple_packed_host else nullcontext():
++            self.ngram_embedding = VocabParallelEmbedding(
++                padded_vocab_size,
++                self.head_dim_per_ngram,
++                params_dtype=(
++                    torch.float8_e4m3fn
++                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
++                    or ple_embedding_dtype == "nvfp4"
++                    else torch.bfloat16
++                ),
++                output_dtype=torch.bfloat16,
++                use_attn_tp_group=self.use_attn_tp_ngram,
++            )
+         self.ngram_embedding.register_buffer(
+             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+         )
+@@ -808,6 +812,22 @@ def _dequant_mxfp8_block(
+     return (weight.to(torch.float32) * mult).to(dtype)
+ 
+ 
++from sglang.srt.models.packed_ple import PackedPLEStorage, gather_packed_kernel
++
++
++def _ple_packed_host_wanted(config) -> bool:
++    """Keep the checkpoint's packed bytes in host RAM and dequantize them in the
++    gather kernel, instead of expanding the table to fp8 at load. SGLANG_PLE_PACKED_NVFP4=0
++    forces the fp8 expansion (the fallback for TP>2 and the file backend).
++    """
++    return (
++        getattr(config, "ple_embedding_dtype", None) == "nvfp4"
++        and bool(getattr(config, "ple_offload_embedding", False))
++        and getattr(config, "ple_offload_backend", "pinned") == "pinned"
++        and os.environ.get("SGLANG_PLE_PACKED_NVFP4", "1") == "1"
++    )
++
++
+ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+     """PLE table read directly from host memory (pinned, or a file-backed mmap).
+ 
+@@ -840,6 +860,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+         *,
+         backend: str = "pinned",
+         table_dir: Optional[str] = None,
++        packed_nvfp4: bool = False,
+     ) -> None:
+         nn.Module.__init__(self)
+         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
+@@ -862,17 +883,37 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+         self.quant_method = None
+ 
+         source_weight = embedding.weight
+-        host_table = allocate_ple_host_table(
+-            shape=source_weight.shape,
+-            dtype=source_weight.dtype,
+-            backend=backend,
+-            table_dir=table_dir,
+-            # Each TP rank holds a different vocabulary shard of the same shape.
+-            tag=(
+-                f"rows{self.shard_indices.org_vocab_start_index}"
+-                f"-{self.shard_indices.org_vocab_end_index}"
+-            ),
++        self._packed_storage = None
++        self._packed_fp8_reference = (
++            os.environ.get("SGLANG_PLE_PACKED_FP8_REFERENCE", "0") == "1"
+         )
++        if packed_nvfp4 and self.tp_size in (1, 2):
++            self._packed_storage = PackedPLEStorage(
++                source_weight.shape[0], self.embedding_dim
++            )
++            if self.tp_size == 2:
++                self._packed_storage.validate_tp2_partition(self)
++            host_table = self._packed_storage.weight
++        else:
++            if packed_nvfp4:
++                logger.warning(
++                    "%s packed PLE covers TP1/TP2 only, tp_size=%d: expanding the "
++                    "table to %s at load",
++                    "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION]",
++                    self.tp_size,
++                    source_weight.dtype,
++                )
++            host_table = allocate_ple_host_table(
++                shape=source_weight.shape,
++                dtype=source_weight.dtype,
++                backend=backend,
++                table_dir=table_dir,
++                # Each TP rank holds a different vocabulary shard of the same shape.
++                tag=(
++                    f"rows{self.shard_indices.org_vocab_start_index}"
++                    f"-{self.shard_indices.org_vocab_end_index}"
++                ),
++            )
+         # Only the file backend has anything to prefetch (rows live on storage).
+         self._file_prefetcher = make_ple_file_prefetcher(host_table)
+         # ... and only it needs its resident set bounded: a fault maps a whole
+@@ -919,7 +960,26 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+                 )
+             output = out
+ 
+-        flat_ids = input_ids.reshape(-1).long()
++        flat_ids = input_ids.reshape(-1).long().contiguous()
++        storage = self._packed_storage
++        if storage is not None:
++            if storage.global_scale is None:
++                raise RuntimeError("packed PLE lookup before checkpoint load")
++            if flat_ids.numel():
++                gather_packed_kernel[(flat_ids.numel(),)](
++                    storage.weight.data_ptr(),
++                    storage.scales.data_ptr(),
++                    flat_ids,
++                    output,
++                    storage.global_scale,
++                    self.embedding_dim,
++                    self.shard_indices.org_vocab_start_index,
++                    self.shard_indices.org_vocab_end_index,
++                    self._packed_fp8_reference,
++                    self._block_d,
++                    enable_fp_fusion=False,
++                )
++            return output
+         if flat_ids.numel():
+             if self._file_prefetcher is not None:
+                 self._file_prefetcher.enqueue(
+@@ -946,6 +1006,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
+             return tensor_model_parallel_all_reduce(output)
+         return output
+ 
++    def reject_scattered_tp2(self) -> None:
++        if self._packed_storage is not None and self.tp_size == 2:
++            if get_attn_tp_context().input_scattered:
++                raise RuntimeError(
++                    "packed TP2 PLE does not support input_scattered: pre-nonlinear "
++                    "reduction ownership is unproven"
++                )
++
+     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.reduce(self.gather(input_ids))
+ 
+@@ -978,6 +1046,7 @@ class Qwen4ExpPLELayer(nn.Module):
+                 self.ple_embedding.ngram_embedding,
+                 backend=getattr(config, "ple_offload_backend", "pinned"),
+                 table_dir=getattr(config, "ple_offload_dir", None),
++                packed_nvfp4=self.ple_embedding._ple_packed_host,
+             )
+         self.short_conv_dilation = self.ple_embedding.ngram_size
+         self.short_conv_state_len = (
+@@ -1193,6 +1262,7 @@ class Qwen4ExpPLELayer(nn.Module):
+         forward_batch: ForwardBatch,
+     ) -> None:
+         """Gather PLE rows via UVA while the preceding decoder layer runs."""
++        self.ple_embedding.ngram_embedding.reject_scattered_tp2()
+         if self._prefetch_stream is None:
+             return
+         if self._prefetch_state is not None:
+@@ -2199,6 +2269,24 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                     return True
+                 packed, scale = pair.pop("weight"), pair.pop("scale")
+                 rows, half_cols = packed.shape
++                storage = getattr(emb, "_packed_storage", None)
++                if storage is not None:
++                    # Row-major checkpoint bytes go straight to the host table; the
++                    # gather kernel dequantizes them, so nothing here touches cols.
++                    shard_size = (
++                        emb.org_vocab_size + ple_num_sync_shards - 1
++                    ) // ple_num_sync_shards
++                    storage.load(
++                        packed,
++                        scale,
++                        shard_idx * shard_size,
++                        emb.shard_indices.org_vocab_start_index,
++                        emb.shard_indices.org_vocab_end_index,
++                        _ple_resolve_global_scale(ple_mod, mod_prefix),
++                    )
++                    ple_packed_pending.pop((mod_prefix, shard_idx), None)
++                    loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
++                    return True
+                 ple_packed_stats["rows"] += rows
+                 ple_packed_stats["bytes"] += packed.numel() + scale.numel()
+                 cols = half_cols * 2
+@@ -2681,6 +2769,24 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                 f"[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] packed PLE shard pairs never completed ({stuck})"
+             )
+ 
++        for ple_mod in ple_modules.values():
++            emb = ple_mod.ngram_embedding
++            storage = getattr(emb, "_packed_storage", None)
++            if storage is not None:
++                storage.finalize(
++                    emb.shard_indices.org_vocab_start_index,
++                    emb.shard_indices.org_vocab_end_index,
++                    expected_global_shards=ple_num_sync_shards,
++                    global_rows=emb.org_vocab_size,
++                )
++                logger.info(
++                    "%s packed nvfp4 PLE retained %.2f GiB pinned host bytes, no "
++                    "dequant at load (fp8_reference=%s)",
++                    "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION]",
++                    storage.nbytes / 2**30,
++                    emb._packed_fp8_reference,
++                )
++
+         if gdn_ba_pending:
+             stuck = ", ".join(
+                 f"{base}.in_proj_{comp} missing "

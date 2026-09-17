@@ -28,20 +28,40 @@
 # RecoverSSM is present but only active with MTP/NEXTN and
 # --gdn-mtp-cache-mode none.
 #
-# 0004 is not applied: this image supports the RadixArk and NVIDIA checkpoints;
-# the local-inference-lab compatibility aliases are outside this stack.
+# LIL (local-inference-lab) support is 0020, not 0004. Kanadaj's 0004 was written
+# against the old qwen38flashnext base; this image base refactored the PLE dtype
+# selection into _ple_table_is_fp8() and absorbed the fp8 auto-switch, so 0020 is
+# that patch re-anchored onto 4ccff141db. It applies after 0001-0008, not between
+# 0003 and 0005, because its PLE loader context includes 0008's lifetime fix.
 
 FROM docker.io/lmsysorg/sglang:dev-cu13-qwen38-next-local@sha256:9d2a843c706c74bc259c0d9abf360551eb2734e1e7d255ab012a6965f10480b6
 
+# Log-prefix revision. Patches carry the SGLANG_PATCHES_REVISION marker rather than a
+# literal, so the string is stamped once here instead of in 26 places across the patch
+# set, and a future upstream drop cannot carry a stale revision. The stamp below also
+# catches a bare r<digits> a patch may still bring. Declared before LABEL so that
+# ai.sglang.revision expands instead of going empty. Keep it in step with the tag.
+ARG SGLANG_REVISION=r24
+
 LABEL ai.sglang.base.commit="4ccff141dbe992794f9da6c3aa23535b4f72000d" \
-      ai.sglang.patchset="0001-sm120-fp8-kv-cache,0002-sm120-gdn-recover-ssm,0003-sm120-online-fp8,0005-abort-ghost-fixes,0006-single-gpu-token-sync,0007-warm-grammar-path-before-serving,0008-qwen4-loader-release-refs" \
-      ai.sglang.target.checkpoint="RadixArk/Qwen3.8-Flash-Next-NVFP4,nv-community/Qwen3.8-Flash-Next-NVFP4" \
+      ai.sglang.patchset="0001-sm120-fp8-kv-cache,0002-sm120-gdn-recover-ssm,0003-sm120-online-fp8,0005-abort-ghost-fixes,0006-single-gpu-token-sync,0007-warm-grammar-path-before-serving,0008-qwen4-loader-release-refs,0020-serve-lil-checkpoint,0021-lil-loader-tp2-corrections,0022-lil-language-model-only,0023-vision-mxfp8-padding-marlin-bias,0024-qwen-flash-next-multimodal-alias,0025-packed-ple-host-storage" \
+      ai.sglang.revision="${SGLANG_REVISION}" \
+      ai.sglang.target.checkpoint="RadixArk/Qwen3.8-Flash-Next-NVFP4,nv-community/Qwen3.8-Flash-Next-NVFP4,local-inference-lab/Qwen3.8-Flash-Next-NVFP4" \
       ai.sglang.mtp="RecoverSSM-capable"
 
 WORKDIR /sgl-workspace/sglang
 
-# 0004 is intentionally omitted because it only adapts the
-# local-inference-lab checkpoint.
+# 0020-0025 are the ported local-inference-lab layers, numbered past 0008 on
+# purpose: the sorted apply loop must run them after the upstream loader fixes.
+# Kanadaj 0008/0011/0018 applied unchanged against this base; 0020 and part of
+# 0022 were re-anchored. Two of kanadaj's hunks were dropped as already upstream:
+# the MTP mixed-precision gate (qwen3_5_mtp.py answers from quantized_layers now)
+# and the draft NVFP4 A16 support (W4A16_NVFP4 is a native algo here).
+# 0025 is kanadaj 0010 re-anchored onto 0020's loader: the nvfp4 table stays packed in
+# pinned host RAM and the gather kernel dequantizes a row at lookup, so boot never
+# expands 51.2B elements. On by default for nvfp4 + pinned backend at TP1/TP2; the fp8
+# expansion stays as the fallback for the file backend, TP>2, or SGLANG_PLE_PACKED_NVFP4=0.
+# Not ported: kanadaj 0012 (loader-resolved checkpoint source for the PLE scale pre-read).
 COPY patches/0001-sm120-fp8-kv-cache.patch /opt/qwen38-patches/0001-sm120-fp8-kv-cache.patch
 COPY patches/0002-sm120-gdn-recover-ssm.patch /opt/qwen38-patches/0002-sm120-gdn-recover-ssm.patch
 COPY patches/0003-sm120-online-fp8.patch /opt/qwen38-patches/0003-sm120-online-fp8.patch
@@ -49,6 +69,12 @@ COPY patches/0005-abort-ghost-fixes.patch /opt/qwen38-patches/0005-abort-ghost-f
 COPY patches/0006-single-gpu-token-sync.patch /opt/qwen38-patches/0006-single-gpu-token-sync.patch
 COPY patches/0007-warm-grammar-path-before-serving.patch /opt/qwen38-patches/0007-warm-grammar-path-before-serving.patch
 COPY patches/0008-qwen4-loader-release-refs.patch /opt/qwen38-patches/0008-qwen4-loader-release-refs.patch
+COPY patches/0020-serve-lil-checkpoint.patch /opt/qwen38-patches/0020-serve-lil-checkpoint.patch
+COPY patches/0021-lil-loader-tp2-corrections.patch /opt/qwen38-patches/0021-lil-loader-tp2-corrections.patch
+COPY patches/0022-lil-language-model-only.patch /opt/qwen38-patches/0022-lil-language-model-only.patch
+COPY patches/0023-vision-mxfp8-padding-marlin-bias.patch /opt/qwen38-patches/0023-vision-mxfp8-padding-marlin-bias.patch
+COPY patches/0024-qwen-flash-next-multimodal-alias.patch /opt/qwen38-patches/0024-qwen-flash-next-multimodal-alias.patch
+COPY patches/0025-packed-ple-host-storage.patch /opt/qwen38-patches/0025-packed-ple-host-storage.patch
 COPY tests/check_loader_lifetime.py /opt/qwen38-tests/check_loader_lifetime.py
 
 RUN set -eux; \
@@ -59,6 +85,7 @@ RUN set -eux; \
         git apply --check "$p" || { echo "ERROR: $(basename $p) does not apply cleanly to the image tree"; exit 1; }; \
         git apply "$p"; \
     done; \
+    grep -rl 'sm120-turbo' python/sglang | xargs -r sed -i -e "s/sm120-turbo SGLANG_PATCHES_REVISION/sm120-turbo ${SGLANG_REVISION}/g" -e "s/sm120-turbo r[0-9][0-9]*/sm120-turbo ${SGLANG_REVISION}/g"; \
     rm -rf /opt/qwen38-patches; \
     python3 /opt/qwen38-tests/check_loader_lifetime.py python/sglang/srt/models/qwen4_exp.py
 
@@ -83,4 +110,26 @@ from sglang.srt.entrypoints.warmup import _warmup_registry as r; \
 assert 'sm120_turbo_structured_output' in r, 'patch 0007 did not register the grammar warmup'; \
 import sglang.srt.managers.scheduler as sc; \
 assert 'self.abort_request(AbortReq(rid=req.rid))' in inspect.getsource(sc.Scheduler), 'patch 0005 did not apply'; \
- print('next-local: all patches verified')"
+from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY as lil; \
+assert 'qwen3_8_flash_next' in lil and 'qwen3_8_flash_next_text' in lil, 'patch 0020 LIL config aliases missing'; \
+msrc = pathlib.Path('python/sglang/srt/layers/quantization/modelopt_quant.py').read_text(); \
+assert '_ple_source_packed' in inspect.getsource(q4.load_weights), 'patch 0020 packed nvfp4 PLE loader missing'; \
+assert '_ple_resolve_global_scale' in inspect.getsource(q4.load_weights), 'patch 0020 nvfp4 global-scale pre-read missing'; \
+assert getattr(q4, 'supports_visual_quantization', False) is True, 'patch 0021 visual quantization not enabled'; \
+from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration as vl; \
+assert getattr(vl, 'supports_visual_quantization', True) is False, 'patch 0021 VL opt-in default missing'; \
+assert 'quant_config if self.supports_visual_quantization else None' in inspect.getsource(vl.__init__), 'patch 0021 vision quant_config gate missing'; \
+from sglang.srt.server_args import ServerArgs as sa; \
+assert 'Qwen4ExpForConditionalGeneration' in sa.LANGUAGE_MODEL_ONLY_ARCHITECTURES, 'patch 0022 language-model-only allowlist missing'; \
+assert 'qwen3_8_flash_next' in pathlib.Path('python/sglang/srt/layers/rotary_embedding/mrope_rope_index.py').read_text(), 'patch 0022 mrope model_type alias missing'; \
+from sglang.srt.layers.quantization import vision_mxfp8 as vm; \
+assert hasattr(vm, 'VisionMxfp8PaddedLinearMethod') and hasattr(vm, 'VisionNvFp4A16LinearMethod'), 'patch 0023 vision adapters missing'; \
+assert 'VisionMxfp8PaddedLinearMethod(self.mxfp8_config)' in msrc and 'VisionNvFp4A16LinearMethod(self.nvfp4a16_config)' in msrc, 'patch 0023 vision branches not wired into get_quant_method'; \
+assert pathlib.Path('python/sglang/srt/multimodal/processors/qwen_vl.py').read_text().count('qwen3_8_flash_next') >= 4, 'patch 0024 multimodal alias missing'; \
+from sglang.srt.models import packed_ple as pp; \
+assert hasattr(pp, 'PackedPLEStorage') and hasattr(pp, 'gather_packed_kernel'), 'patch 0025 packed PLE module missing'; \
+from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding as phe, _ple_packed_host_wanted as pw; \
+assert 'gather_packed_kernel' in inspect.getsource(phe.gather), 'patch 0025 gather does not dispatch to the packed kernel'; \
+assert 'storage.finalize(' in inspect.getsource(q4.load_weights), 'patch 0025 loader does not retain packed shards'; \
+assert pw(type('C', (), {'ple_embedding_dtype': 'nvfp4', 'ple_offload_embedding': True, 'ple_offload_backend': 'pinned'})()) is True, 'patch 0025 packed storage is not the default for nvfp4 + pinned'; \
+assert not [q for q in pathlib.Path('python/sglang').rglob('*.py') if 'SGLANG_PATCHES_REVISION' in q.read_text()], 'revision marker survived the stamp'"

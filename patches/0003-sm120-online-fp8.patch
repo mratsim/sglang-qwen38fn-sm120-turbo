@@ -719,7 +719,7 @@ index c0cf4fc..4c9b571 100644
 +
 +        _online_mod.online_fp8_enabled = True
 +        logger.info(
-+            "[mratsim's sm120-turbo r22] SM120 online FP8 enabled (HyperConnection mix pair born meta and ingested rowwise fp8, lm_head replaced at end of load)"
++            "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] SM120 online FP8 enabled (HyperConnection mix pair born meta and ingested rowwise fp8, lm_head replaced at end of load)"
 +        )
 +
      _BF16_GEMM_BACKEND = backend
@@ -847,7 +847,7 @@ index fa982a2..eeda089 100644
 +                # (no MXFP8 dense kernel for this device). Any other type is a bug in this path
 +                # and must crash: staying bf16 silently would hide it.
 +                logging.getLogger(__name__).warning(
-+                    "[mratsim's sm120-turbo r22] sm120 online MXFP8 unavailable (%s); unquantized "
++                    "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] sm120 online MXFP8 unavailable (%s); unquantized "
 +                    "linears stay bf16",
 +                    exc,
 +                )
@@ -867,7 +867,7 @@ index fa982a2..eeda089 100644
 +            if not _ONLINE_MXFP8_LOGGED:
 +                _ONLINE_MXFP8_LOGGED = True
 +                logging.getLogger(__name__).info(
-+                    "[mratsim's sm120-turbo r22] sm120 online MXFP8: unquantized linears quantize at "
++                    "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] sm120 online MXFP8: unquantized linears quantize at "
 +                    "load (dense backend=%s)",
 +                    quant_method.mxfp8_dense_backend,
 +                )
@@ -902,7 +902,7 @@ index fa982a2..eeda089 100644
 +            counts[(family, type(module).__name__, method, str(weight.dtype))] += 1
 +        for (family, cls, method, dtype), n in sorted(counts.items()):
 +            logger.info(
-+                "[mratsim's sm120-turbo r22] weights %s x%s %s %s x%d",
++                "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] weights %s x%s %s %s x%d",
 +                family,
 +                cls,
 +                method,
@@ -936,7 +936,7 @@ index fa982a2..eeda089 100644
 +                freed += _online.replace_linears_with_fp8_copies([module])
 +        torch.cuda.empty_cache()
 +        logger.info(
-+            "[mratsim's sm120-turbo r22] sm120 online FP8 replace: %d weights "
++            "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] sm120 online FP8 replace: %d weights "
 +            "rowwise-fp8 at load (%.2f GiB bf16 never materialized), freed "
 +            "%.2f GiB (lm_head); the rowwise fp8 tensors are the resident weights",
 +            _online._rowwise_load_stats["weights"],
@@ -952,7 +952,7 @@ index fa982a2..eeda089 100644
                      )
                  logger.info(
 -                    "PLE embedding switched to fp8 storage: %s (%s)",
-+                    "[mratsim's sm120-turbo r22] PLE embedding switched to fp8 storage: %s (%s)",
++                    "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] PLE embedding switched to fp8 storage: %s (%s)",
                      mod_prefix,
                      tuple(emb.weight.data.shape),
                  )
@@ -961,7 +961,7 @@ index fa982a2..eeda089 100644
                      load_qwen4_exp_ple_shard._warned_downcast = True
                      logger.warning(
 -                        "PLE checkpoint shards are %s but the embedding storage "
-+                        "[mratsim's sm120-turbo r22] PLE checkpoint shards are %s but the embedding storage "
++                        "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] PLE checkpoint shards are %s but the embedding storage "
                          "is fp8 (ple_embedding_dtype / fp8 quant config); "
                          "downcasting is lossy",
                          loaded_weight.dtype,

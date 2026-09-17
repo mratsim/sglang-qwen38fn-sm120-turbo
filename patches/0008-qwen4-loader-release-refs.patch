@@ -21,5 +21,5 @@ diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qw
 +                if not warned_ple_downcast:
 +                    warned_ple_downcast = True
                      logger.warning(
-                         "[mratsim's sm120-turbo r22] PLE checkpoint shards are %s but the embedding storage "
+                         "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] PLE checkpoint shards are %s but the embedding storage "
                          "is fp8 (ple_embedding_dtype / fp8 quant config); "

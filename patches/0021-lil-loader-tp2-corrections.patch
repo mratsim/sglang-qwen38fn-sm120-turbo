@@ -1,0 +1,87 @@
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index 7a49826b2b..b2adc8fafa 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -270,6 +270,8 @@ def _modelopt_module_form_aliases(key: str):
+         if ".self_attn." in module:
+             yield module.replace(".self_attn.", ".")
+     if key.startswith("model.visual."):
++        if key.endswith(".attn.qkv"):
++            yield key + "_proj"
+         module = key.replace("model.visual.", "visual.")
+         if module.endswith(".attn.qkv"):
+             module += "_proj"
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index a3122d0046..cdb84bba02 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -1211,6 +1211,7 @@ class Qwen3LLMModel(Qwen3Model):
+ 
+ class Qwen3VLForConditionalGeneration(nn.Module):
+     supports_cuda_vmm_feature_transport = True
++    supports_visual_quantization = False
+ 
+     # To ensure correct weight loading and mapping.
+     hf_to_sglang_mapper = WeightsMapper(
+@@ -1246,9 +1247,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
+         else:
+             self.visual = Qwen3VLMoeVisionModel(
+                 config.vision_config,
+-                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+-                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+-                quant_config=None,
++                # Quantization is opt-in per architecture because most Qwen3-VL
++                # vision quantization methods remain untested.
++                quant_config=(
++                    quant_config if self.supports_visual_quantization else None
++                ),
+                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                 prefix=add_prefix("model.visual", prefix),
+                 use_data_parallel=self.use_data_parallel,
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 7b47dea956..15bbe70792 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -1905,6 +1905,7 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
+ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+     hf_to_sglang_mapper = None
++    supports_visual_quantization = True
+ 
+     def __init__(
+         self,
+@@ -2384,7 +2385,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+             )
+             if match is None or "visual" in name:
+                 return False
+-            comp, kind = match.group(1), match.group(2)
++            comp, checkpoint_kind = match.group(1), match.group(2)
++            kind = "scale" if checkpoint_kind == "weight_scale" else "weight"
+             if kind == "weight":
+                 if loaded_weight.dtype != torch.float8_e4m3fn:
+                     return False
+@@ -2410,6 +2412,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+                 _dequant_mxfp8_block(weight, scale),
+                 0 if comp == "b" else 1,
+             )
++            gdn_ba_pending.pop((base, comp))
+             return True
+ 
+         def _scale_claimed_by_map(scale_name: str) -> bool:
+@@ -2668,6 +2671,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+             if isinstance(module, Qwen3_5GatedDeltaNet):
+                 module.finalize_fused_in_proj()
+ 
++        if ple_packed_pending:
++            stuck = ", ".join(
++                f"{module}.shard_{shard} missing "
++                + ("weight" if "weight" not in pair else "scale")
++                for (module, shard), pair in sorted(ple_packed_pending.items())
++            )
++            raise RuntimeError(
++                f"[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] packed PLE shard pairs never completed ({stuck})"
++            )
++
+         if gdn_ba_pending:
+             stuck = ", ".join(
+                 f"{base}.in_proj_{comp} missing "

@@ -71,7 +71,7 @@ index 2608621..42a49c9 100644
 +    async for _ in tokenizer_manager.generate_request(req, None):
 +        pass
 +    logger.info(
-+        "[mratsim's sm120-turbo r22] grammar warmup: FSM compiled and the token bitmask"
++        "[mratsim's sm120-turbo SGLANG_PATCHES_REVISION] grammar warmup: FSM compiled and the token bitmask"
 +        " kernel reached the device."
 +    )
 \ No newline at end of file

@@ -156,9 +156,10 @@ SERVER_ARGS=(
         --warmups sm120_turbo_structured_output
         # PLE 51B n-gram table -> pinned host RAM
         --ple-offload-embedding
-        # Attention backends
+        # Backends
         --linear-attn-prefill-backend flashinfer
         --linear-attn-decode-backend flashinfer
+        --moe-runner-backend flashinfer_cutlass
         # Mamba (GDN linear attention)
         --max-mamba-cache-size "${MAMBA_CACHE}"
         --mamba-radix-cache-strategy extra_buffer_lazy

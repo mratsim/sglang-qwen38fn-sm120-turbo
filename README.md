@@ -1,6 +1,6 @@
 # sglang-qwen38fn-sm120-turbo
 
-Serving stack for **Qwen3.8-Flash-Next** on 96 GiB VRAM (1x RTX Pro 6000, might also work on DGX Spark):
+Serving stack for **Qwen3.8-Flash-Next** on 96 GiB VRAM (1x RTX Pro 6000) or 192 GiB VRAM (2x RTX Pro 6000):
 - https://qwen.ai/blog?id=qwen3.8-flash-next
 - https://huggingface.co/Qwen/Qwen3.8-Flash-Next
 - https://github.com/QwenLM/Qwen3.8-Flash-Next/blob/main/tech_report.pdf
@@ -8,8 +8,20 @@ Serving stack for **Qwen3.8-Flash-Next** on 96 GiB VRAM (1x RTX Pro 6000, might 
 Qwen3.8-Flash-Next is a highly performant LLM that serves as a preview for the future Qwen4 family.
 Despite being undertrained, and having very few active parameters and a small size (125B + 6B active + 51B of offloadable embedding table), benchmarks show performance comparable to closed-source LLMs from just 3 months ago (e.g. Opus 4.8).
 
+> [!IMPORTANT]
+> **What's new since r22.**
+>
+> **r23 — NVIDIA release.** Support for the ModelOpt checkpoint
+> `nvidia/Qwen3.8-Flash-Next-NVFP4`, served by
+> `serve_sglang_qwen3.8-flash-next-nvidia-tp1-example.sh`.
+>
+> **r24 — TP=2 + High quality QAD (Quantization-Aware Distillation from local-inference-lab)**
+> QAD uses the BF16 model to recalibrate the NVFP4 model and recover quantization losses after multi-days recalibration on 16x RTX Pro 6000. Furthermore we now support the W4A16_NVFP4 format which unlike bae NVFP4, keeps activations in 16-bit so activation spikes are properly carried over to consuming layers without distorting scale or being clamped.
+
 > [!TIP]
 > *Monitor your server with [`sgtop`](https://github.com/mratsim/sgtop), my sglang dedicated monitoring tool.*
+>
+> ![sgtop watching Qwen3.8-Flash-Next serve 6 concurrent requests](images/sgtop-agg6.png)
 
 ## Numbers
 
@@ -64,40 +76,7 @@ served by `serve_sglang_qwen3.8-flash-next-lil-tp2-example.sh` at TP=2 on 2x RTX
 ## Behind-the-scenes
 
 This builds on the pinned `lmsysorg/sglang:dev-cu13-qwen38-next-local`
-image at SGLang commit `4ccff141dbe992794f9da6c3aa23535b4f72000d`.
-The resulting image serves all three released Qwen3.8-Flash-Next checkpoints:
-
-- **0001** makes fp8 KV cache work on sm_120.
-- **0002** linear-attention layers don't cache MTP drafts, they are recomputed. Saves ~2 GB of KV budget. (And it's surprisingly not slower)
-- **0003** quantizes at load whatever the checkpoint left in bf16 (attention, MLP, lm_head, hyperconnection mix) to MXFP8 to reduce memory bandwidth at close to zero-accuracy cost. On FlashInfer 0.6.18, this should be even faster as FlashInfer 0.6.18 integrates [`local-inference-lab/b12x`](https://github.com/local-inference-lab/b12x) and its hardware-accelerated block-scaled GEMM kernel.
-- **0005** keeps abandoned runs from eating the machine: an aborted or timed-out client now really evicts its request, and no longer starves the queue behind it.
-- **0006** stops the sampler from using NNCL when the server has a single GPU. This was a bug or an oversight in structured JSON decoding, that led to extra GPU memory utilization.
-- **0007** Preload triton kernels at boot via long prefill warmup and structure decoding warmup to ensure reserved GPU memory is sufficient and server doesn't crash in the middle of queries.
-- **0008** removes a self-reference in the PLE shard loader. Its closure retained
-  the loading-time parameter dictionary, keeping replaced MoE scale buffers and
-  the old BF16 `lm_head` alive until cyclic GC. On the tested NVIDIA checkpoint
-  with online MXFP8, those stale tensors total 8.215 GiB. They can now be
-  released during loading.
-
-Earlier release changes when memory becomes available; it does not remove
-additional resident model weights. Automatic KV sizing can use the reclaimed
-space. To retain GPU headroom, set an explicit total KV token cap, for example
-cap: append `--max-total-tokens 570048` to the NVIDIA launcher. It caps the shared cache
-capacity, not the per-request context length. MTP also needs its own model, KV, and graphs.
-
-> [!IMPORTANT]
-> **What's new since r22.**
->
-> **r23 — the NVIDIA release.** Support for the ModelOpt checkpoint
-> `nvidia/Qwen3.8-Flash-Next-NVFP4`, served by
-> `serve_sglang_qwen3.8-flash-next-nvidia-tp1-example.sh`.
->
-> **r24 — the local-inference-lab release, on two GPUs.** The third released checkpoint,
-> `local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, whose layers are quantized three different ways
-> inside a single checkpoint. It runs across two GPUs with a **327,680-token** context window.
->
-> r24 also stamps the build revision into the log lines and the image label, so a log can
-> identify which build produced it. See `ai.sglang.revision`.
+image at SGLang commit `4ccff141dbe992794f9da6c3aa23535b4f72000d` with patches in `patches/` being applied on top.
 
 ## Build and serve
 
@@ -136,72 +115,41 @@ curl -s localhost:30000/health
 
 ### NVIDIA checkpoint
 
-The launcher uses [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) with
-`modelopt_mixed`. It explicitly selects `flashinfer_cutlass` for both target
-and speculative NVFP4 MoE; leaving these runners on `auto` selects an
-unsupported backend on this base.
+[`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
 
 ```bash
 ./serve_sglang_qwen3.8-flash-next-nvidia-tp1-example.sh
 curl -s localhost:8000/health
 ```
 
-Its RTX PRO 6000 defaults include:
-
-```bash
-ONLINE_MXFP8=true
-MTP=true
-GDN_MTP_CACHE_MODE=none
-MAX_RUNNING=12
-MAMBA_CACHE=$(( 4 * MAX_RUNNING + 3 ))
-HICACHE_SIZE=30
-```
-
-The NVIDIA configuration loaded target and MTP draft weights, replaced 194
-otherwise-unquantized weights with online MXFP8, captured target verify plus
-draft decode/extend CUDA graphs, and completed a 231-token generation with a
-speculative accept length of 3.17 and accept rate of 0.72. The 30 GB
-hierarchical cache allocated 23.68 GB for KV and 6.35 GB for Mamba.
-
-With FP8 KV cache, this checkpoint currently logs that no KV scaling factors
-were provided and defaults them to 1.0. This does not prevent startup, but
-accuracy-sensitive deployments should compare it with the default KV dtype.
-
 ### The local-inference-lab release
 
-The third supported checkpoint, and the only one that needs two GPUs. Its layers arrive already
-quantized three different ways — MXFP8 for the dense linears, NVFP4 for the experts, and a
-narrower NVFP4 for a few projections — so unlike the launchers above it runs with the at-load
-quantization switched off: there is nothing left for it to do.
+The QAD release from
+[`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4),
+the one described in the r24 note above. Its attention layers are prequantized MXFP8, so this launcher runs
+with the ONLINE_MXFP8 off.
 
-Served by `serve_sglang_qwen3.8-flash-next-lil-tp2-example.sh`, which reads the checkpoint
-from either source: `MODEL_SOURCE=hf` lets sglang resolve the hub id itself, and
-`MODEL_SOURCE=local` (the default) reads a snapshot you fetched once with
-`hf download --revision qad-step-4000 --local-dir …`, no network at boot. The QAD snapshot is
-a *branch* of that repo, so `MODEL_REVISION` has to name it on both paths.
+QAD is a **branch** of that repo, `qad-step-4000`, not its default revision.
+
+For local download
+```
+hf download local-inference-lab/Qwen3.8-Flash-Next-NVFP4 --revision qad-step-4000 --local-dir …`
+```
+
 
 ```bash
 ./serve_sglang_qwen3.8-flash-next-lil-tp2-example.sh
 curl -s localhost:30000/health
 ```
 
-- **Hardware:** 2x RTX PRO 6000.
-- **System RAM:** 192 GiB. The prompt-embedding table (27 GiB) and the KV offload pool both
-  live in pinned host memory, so budget about 86 GiB of it as untouchable.
-- **Context:** 327,680 tokens, 1.25x YaRN over the trained 262,144. The launcher injects the
-  rope settings, because this checkpoint ships none of its own.
-- **Quality:** `qad-step-4000` is the recommended checkpoint for output quality. Against the
+The example script shows how to run the model on TP=2 with YaRN to 327680 max context.
+The model supports up to 1M context with YaRN.
+
+- **Quality:** `qad-step-4000` is the recommended checkpoint of the three. Against the
   published NVFP4 revision it scored 79.4% vs 77.5% on AA-LCR v1.1 over ten generations
   ([AA-LCR report](https://github.com/local-inference-lab/rtx6kpro/blob/e8e23de/models/qwen38-flash-next/aa-lcr-nvfp4-vs-qad.md))
   and 78.69% vs 77.17% on exact arithmetic with reasoning disabled
   ([arithmetic report](https://github.com/local-inference-lab/rtx6kpro/blob/e8e23de/models/qwen38-flash-next/direct-arithmetic-stability-nvfp4-vs-qad.md)).
-
-Two settings the server will not start without:
-
-- `--quantization modelopt_mixed`, because the checkpoint is mixed-precision rather than one
-  quantization scheme.
-- `--mm-enable-dp-encoder`, which replicates the image encoder across the two GPUs instead of
-  splitting it: at this width the encoder's 4304-wide projections do not divide.
 
 ### Your own variants
 
